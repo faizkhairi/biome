@@ -3,13 +3,14 @@ use biome_analyze::{Ast, Rule, RuleDiagnostic, RuleSource, declare_lint_rule};
 use biome_console::markup;
 use biome_diagnostics::Severity;
 use biome_html_syntax::{
-    AnyHtmlContent, AnyHtmlElement, HtmlElementList, HtmlFileSource,
+    AnyHtmlContent, AnyHtmlElement, HtmlElement, HtmlElementList, HtmlFileSource,
 };
+use biome_html_syntax::element_ext::AnyHtmlTagElement;
 use biome_rowan::AstNode;
 use biome_rule_options::use_heading_content::UseHeadingContentOptions;
 
 use crate::a11y::{
-    get_truthy_aria_hidden_attribute, has_accessible_name, html_element_has_truthy_aria_hidden,
+    has_accessible_name, html_element_has_truthy_aria_hidden, is_hidden_from_screen_reader,
     html_self_closing_element_has_accessible_name,
     html_self_closing_element_has_non_empty_attribute,
     html_self_closing_element_has_truthy_aria_hidden,
@@ -77,7 +78,10 @@ declare_lint_rule! {
 const HEADING_ELEMENTS: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
 
 impl Rule for UseHeadingContent {
-    type Query = Ast<AnyHtmlElement>;
+    /// Use `AnyHtmlTagElement` (opening elements + self-closing) rather than `AnyHtmlElement`
+    /// (which also covers text nodes, expressions, CDATA, etc.) to avoid running the rule
+    /// for every content node in the document.
+    type Query = Ast<AnyHtmlTagElement>;
     type State = ();
     type Signals = Option<Self::State>;
     type Options = UseHeadingContentOptions;
@@ -85,15 +89,15 @@ impl Rule for UseHeadingContent {
     fn run(ctx: &RuleContext<Self>) -> Self::Signals {
         let node = ctx.query();
 
-        let element_name = node.name()?;
+        let element_name = node.name().ok()?.token_text_trimmed()?;
         let source_type = ctx.source_type::<HtmlFileSource>();
 
         let is_heading = if source_type.is_html() {
             HEADING_ELEMENTS
                 .iter()
-                .any(|&h| element_name.text().eq_ignore_ascii_case(h))
+                .any(|&h| element_name.eq_ignore_ascii_case(h))
         } else {
-            HEADING_ELEMENTS.contains(&element_name.text())
+            HEADING_ELEMENTS.iter().any(|&h| element_name == h)
         };
 
         if !is_heading {
@@ -101,21 +105,28 @@ impl Rule for UseHeadingContent {
         }
 
         // If the heading itself has aria-hidden, it is hidden from screen readers entirely
-        if get_truthy_aria_hidden_attribute(node).is_some() {
+        if is_hidden_from_screen_reader(node) {
             return Some(());
-        }
-
-        // If the heading has an accessible name (aria-label, aria-labelledby, title),
-        // screen readers can announce it even without visible content
-        if has_accessible_name(node) {
-            return None;
         }
 
         match node {
             // Self-closing headings (e.g. <h1 />) can never have content
-            AnyHtmlElement::HtmlSelfClosingElement(_) => Some(()),
-            AnyHtmlElement::HtmlElement(html_element) => {
+            AnyHtmlTagElement::HtmlSelfClosingElement(element) => {
+                if html_self_closing_element_has_accessible_name(element) {
+                    return None;
+                }
+                Some(())
+            }
+            AnyHtmlTagElement::HtmlOpeningElement(opening) => {
+                // Navigate to the parent HtmlElement to access attributes and children
+                let html_element = opening.syntax().parent().and_then(HtmlElement::cast)?;
                 if html_element.opening_element().is_err() {
+                    return None;
+                }
+                // If the heading has an accessible name (aria-label, aria-labelledby, title),
+                // screen readers can announce it even without visible content
+                let any_element = AnyHtmlElement::from(html_element.clone());
+                if has_accessible_name(&any_element) {
                     return None;
                 }
                 let is_html = source_type.is_html();
@@ -126,16 +137,25 @@ impl Rule for UseHeadingContent {
                     Some(())
                 }
             }
-            _ => None,
         }
     }
 
     fn diagnostic(ctx: &RuleContext<Self>, _: &Self::State) -> Option<RuleDiagnostic> {
         let node = ctx.query();
+        // For non-self-closing headings, report the full element range via parent navigation
+        let range = match node {
+            AnyHtmlTagElement::HtmlOpeningElement(opening) => opening
+                .syntax()
+                .parent()
+                .and_then(HtmlElement::cast)
+                .map(|el| el.syntax().text_trimmed_range())
+                .unwrap_or_else(|| node.syntax().text_trimmed_range()),
+            AnyHtmlTagElement::HtmlSelfClosingElement(_) => node.syntax().text_trimmed_range(),
+        };
         Some(
             RuleDiagnostic::new(
                 rule_category!(),
-                node.syntax().text_trimmed_range(),
+                range,
                 markup! {
                     "Provide screen reader accessible content when using "<Emphasis>"heading"</Emphasis>" elements."
                 },
